@@ -32,8 +32,19 @@ jobs:
                   applicationId = "com.myapps.applock"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0"
+                  versionCode = 2
+                  versionName = "1.1"
+              }
+
+              // Fixed signing key, so future builds install as updates
+              // (no need to uninstall and set up again).
+              signingConfigs {
+                  getByName("debug") {
+                      storeFile = file("applock.jks")
+                      storePassword = "applock123"
+                      keyAlias = "applock"
+                      keyPassword = "applock123"
+                  }
               }
 
               buildTypes {
@@ -123,7 +134,10 @@ jobs:
           import android.content.Intent
           import android.content.IntentFilter
           import android.content.pm.PackageManager
+          import android.os.Handler
+          import android.os.Looper
           import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityWindowInfo
           import android.view.inputmethod.InputMethodManager
           import androidx.core.content.ContextCompat
 
@@ -137,6 +151,8 @@ jobs:
               private var keyboardPkgs = setOf<String>()
               private var lastPkg: String? = null
               private var registered = false
+              private val handler = Handler(Looper.getMainLooper())
+              private val recheck = Runnable { evaluate() }
 
               private val screenReceiver = object : BroadcastReceiver() {
                   override fun onReceive(context: Context, intent: Intent) {
@@ -146,10 +162,7 @@ jobs:
                           // Phone unlocked again: if a locked app is still open, lock it.
                           Intent.ACTION_USER_PRESENT -> {
                               refreshSystemPkgs()
-                              val p = lastPkg
-                              if (p != null && p in Prefs.lockedApps(context) && p !in LockState.unlocked) {
-                                  showLock(p)
-                              }
+                              evaluate()
                           }
                       }
                   }
@@ -167,6 +180,7 @@ jobs:
               }
 
               override fun onDestroy() {
+                  handler.removeCallbacks(recheck)
                   if (registered) unregisterReceiver(screenReceiver)
                   super.onDestroy()
               }
@@ -177,9 +191,28 @@ jobs:
                   // Ignore our own screens, the notification shade and the keyboard.
                   if (pkg == packageName || pkg == "com.android.systemui" || pkg in keyboardPkgs) return
                   lastPkg = pkg
+                  // A closing app can still send an event while it animates away, so we
+                  // don't trust the event alone. We check which app is really in front
+                  // now, and again after the animation has finished.
+                  evaluate()
+                  handler.removeCallbacks(recheck)
+                  handler.postDelayed(recheck, 300)
+              }
+
+              /** The app whose window is actually focused on screen right now. */
+              private fun foregroundPkg(): String? = try {
+                  windows.firstOrNull { it.type == AccessibilityWindowInfo.TYPE_APPLICATION && it.isFocused }
+                      ?.root?.packageName?.toString()
+              } catch (e: Exception) {
+                  null
+              }
+
+              private fun evaluate() {
+                  val fg = foregroundPkg() ?: lastPkg ?: return
+                  if (fg == packageName) return
                   when {
-                      pkg in Prefs.lockedApps(this) -> if (pkg !in LockState.unlocked) showLock(pkg)
-                      pkg in homePkgs -> LockState.unlocked.clear() // went home: lock everything again
+                      fg in Prefs.lockedApps(this) -> if (fg !in LockState.unlocked) showLock(fg)
+                      fg in homePkgs -> LockState.unlocked.clear() // went home: lock everything again
                   }
               }
 
@@ -778,7 +811,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <string name="app_name">App Lock</string>
-              <string name="accessibility_desc">Lets App Lock see which app you open, so it can ask for your PIN before showing locked apps. It does not read anything on your screen.</string>
+              <string name="accessibility_desc">Lets App Lock check which app is on screen, so it can ask for your PIN before showing locked apps. It only reads the app name. It never reads your messages or other screen content, and it has no internet access.</string>
           </resources>
           EOF_APPLOCK
           mkdir -p "$(dirname 'app/src/main/res/xml/accessibility_config.xml')"
@@ -787,8 +820,8 @@ jobs:
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
               android:accessibilityEventTypes="typeWindowStateChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
-              android:accessibilityFlags="flagDefault"
-              android:canRetrieveWindowContent="false"
+              android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows"
+              android:canRetrieveWindowContent="true"
               android:description="@string/accessibility_desc"
               android:notificationTimeout="50" />
           EOF_APPLOCK
@@ -824,6 +857,54 @@ jobs:
           }
           rootProject.name = "AppLock"
           include(":app")
+          EOF_APPLOCK
+          base64 -d > app/applock.jks <<'EOF_APPLOCK'
+          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
+          ZQICJxA=
           EOF_APPLOCK
 
       - name: Set up Java
