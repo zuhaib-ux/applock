@@ -1,0 +1,856 @@
+# App Lock - builds an Android APK from the code below.
+# Upload this file to .github/workflows/ in your GitHub repository.
+# Every time it changes, GitHub builds a new AppLock.apk and puts it under "Releases".
+
+name: Build App Lock APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the project files
+        run: |
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'EOF_APPLOCK'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.myapps.applock"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.myapps.applock"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("androidx.biometric:biometric:1.1.0")
+          }
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'EOF_APPLOCK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.HOME" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.AppCompat.DayNight.DarkActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".LockActivity"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+                      android:excludeFromRecents="true"
+                      android:exported="false"
+                      android:launchMode="singleTask"
+                      android:taskAffinity=""
+                      android:theme="@style/Theme.AppCompat.DayNight.NoActionBar" />
+
+                  <service
+                      android:name=".AppLockService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/java/com/myapps/applock/AppLockService.kt')"
+          cat > 'app/src/main/java/com/myapps/applock/AppLockService.kt' <<'EOF_APPLOCK'
+          package com.myapps.applock
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.PackageManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.inputmethod.InputMethodManager
+          import androidx.core.content.ContextCompat
+
+          /**
+           * Watches which app comes to the front. If it is on the lock list and
+           * hasn't been unlocked yet, shows the PIN screen on top of it.
+           */
+          class AppLockService : AccessibilityService() {
+
+              private var homePkgs = setOf<String>()
+              private var keyboardPkgs = setOf<String>()
+              private var lastPkg: String? = null
+              private var registered = false
+
+              private val screenReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context, intent: Intent) {
+                      when (intent.action) {
+                          // Screen off: forget every unlock.
+                          Intent.ACTION_SCREEN_OFF -> LockState.unlocked.clear()
+                          // Phone unlocked again: if a locked app is still open, lock it.
+                          Intent.ACTION_USER_PRESENT -> {
+                              refreshSystemPkgs()
+                              val p = lastPkg
+                              if (p != null && p in Prefs.lockedApps(context) && p !in LockState.unlocked) {
+                                  showLock(p)
+                              }
+                          }
+                      }
+                  }
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  refreshSystemPkgs()
+                  val filter = IntentFilter().apply {
+                      addAction(Intent.ACTION_SCREEN_OFF)
+                      addAction(Intent.ACTION_USER_PRESENT)
+                  }
+                  ContextCompat.registerReceiver(this, screenReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+                  registered = true
+              }
+
+              override fun onDestroy() {
+                  if (registered) unregisterReceiver(screenReceiver)
+                  super.onDestroy()
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (event == null || event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+                  val pkg = event.packageName?.toString() ?: return
+                  // Ignore our own screens, the notification shade and the keyboard.
+                  if (pkg == packageName || pkg == "com.android.systemui" || pkg in keyboardPkgs) return
+                  lastPkg = pkg
+                  when {
+                      pkg in Prefs.lockedApps(this) -> if (pkg !in LockState.unlocked) showLock(pkg)
+                      pkg in homePkgs -> LockState.unlocked.clear() // went home: lock everything again
+                  }
+              }
+
+              override fun onInterrupt() {}
+
+              private fun refreshSystemPkgs() {
+                  val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+                  val launcher = packageManager.resolveActivity(home, PackageManager.MATCH_DEFAULT_ONLY)
+                      ?.activityInfo?.packageName
+                  homePkgs = setOfNotNull(launcher).filter { it != "android" }.toSet()
+                  val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                  keyboardPkgs = imm.enabledInputMethodList.map { it.packageName }.toSet()
+              }
+
+              private fun showLock(pkg: String) {
+                  val i = Intent(this, LockActivity::class.java)
+                      .putExtra(LockActivity.EXTRA_PKG, pkg)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                  startActivity(i)
+              }
+          }
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/java/com/myapps/applock/LockActivity.kt')"
+          cat > 'app/src/main/java/com/myapps/applock/LockActivity.kt' <<'EOF_APPLOCK'
+          package com.myapps.applock
+
+          import android.content.Intent
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.os.SystemClock
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.GridLayout
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import androidx.activity.OnBackPressedCallback
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.biometric.BiometricManager
+          import androidx.biometric.BiometricPrompt
+          import androidx.core.content.ContextCompat
+
+          /** The PIN / fingerprint screen shown on top of a locked app. */
+          class LockActivity : AppCompatActivity() {
+
+              companion object {
+                  const val EXTRA_PKG = "pkg"
+              }
+
+              private var pkg = ""
+              private val entered = StringBuilder()
+
+              private lateinit var icon: ImageView
+              private lateinit var title: TextView
+              private lateinit var dots: TextView
+              private lateinit var message: TextView
+              private lateinit var prompt: BiometricPrompt
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(buildUi())
+                  prompt = BiometricPrompt(
+                      this,
+                      ContextCompat.getMainExecutor(this),
+                      object : BiometricPrompt.AuthenticationCallback() {
+                          override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                              unlock()
+                          }
+                      }
+                  )
+                  // Back button never opens the locked app; it goes to the home screen.
+                  onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+                      override fun handleOnBackPressed() = goHome()
+                  })
+                  showFor(intent.getStringExtra(EXTRA_PKG) ?: packageName)
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  val newPkg = intent.getStringExtra(EXTRA_PKG) ?: packageName
+                  if (newPkg != pkg) showFor(newPkg)
+              }
+
+              override fun onStop() {
+                  super.onStop()
+                  // If the user leaves this screen, close it. It opens again when needed.
+                  if (!isChangingConfigurations) finish()
+              }
+
+              private fun showFor(p: String) {
+                  pkg = p
+                  if (!Prefs.hasPin(this)) {
+                      finish()
+                      return
+                  }
+                  entered.clear()
+                  message.text = ""
+                  updateDots()
+                  try {
+                      val info = packageManager.getApplicationInfo(p, 0)
+                      title.text = packageManager.getApplicationLabel(info)
+                      icon.setImageDrawable(packageManager.getApplicationIcon(info))
+                  } catch (e: Exception) {
+                      title.text = p
+                  }
+                  icon.post { startBiometric() }
+              }
+
+              private fun biometricReady(): Boolean =
+                  Prefs.useFingerprint(this) &&
+                      BiometricManager.from(this).canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK) ==
+                      BiometricManager.BIOMETRIC_SUCCESS
+
+              private fun startBiometric() {
+                  if (isFinishing || !biometricReady()) return
+                  val info = BiometricPrompt.PromptInfo.Builder()
+                      .setTitle("Unlock ${title.text}")
+                      .setNegativeButtonText("Use PIN")
+                      .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_WEAK)
+                      .build()
+                  prompt.authenticate(info)
+              }
+
+              private fun press(key: String) {
+                  val now = SystemClock.elapsedRealtime()
+                  if (now < LockState.blockedUntil) {
+                      message.text = "Too many tries. Wait ${(LockState.blockedUntil - now) / 1000 + 1} seconds."
+                      return
+                  }
+                  when (key) {
+                      "FP" -> {
+                          startBiometric()
+                          return
+                      }
+                      "DEL" -> if (entered.isNotEmpty()) entered.setLength(entered.length - 1)
+                      else -> if (entered.length < Prefs.pinLength(this)) entered.append(key)
+                  }
+                  message.text = ""
+                  updateDots()
+                  if (entered.length == Prefs.pinLength(this)) {
+                      if (Prefs.checkPin(this, entered.toString())) {
+                          LockState.wrongTries = 0
+                          unlock()
+                      } else {
+                          LockState.wrongTries++
+                          entered.clear()
+                          updateDots()
+                          if (LockState.wrongTries >= 5) {
+                              LockState.wrongTries = 0
+                              LockState.blockedUntil = now + 30_000
+                              message.text = "Too many tries. Wait 30 seconds."
+                          } else {
+                              message.text = "Wrong PIN"
+                          }
+                      }
+                  }
+              }
+
+              private fun updateDots() {
+                  val len = Prefs.pinLength(this)
+                  dots.text = "●".repeat(entered.length) + "○".repeat((len - entered.length).coerceAtLeast(0))
+              }
+
+              private fun unlock() {
+                  LockState.unlocked.add(pkg)
+                  finish()
+                  overridePendingTransition(0, 0)
+              }
+
+              private fun goHome() {
+                  startActivity(
+                      Intent(Intent.ACTION_MAIN)
+                          .addCategory(Intent.CATEGORY_HOME)
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  )
+                  finish()
+              }
+
+              private fun matchWidth() = LinearLayout.LayoutParams(
+                  ViewGroup.LayoutParams.MATCH_PARENT,
+                  ViewGroup.LayoutParams.WRAP_CONTENT
+              )
+
+              private fun buildUi(): View {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      setPadding(dp(24), dp(56), dp(24), dp(24))
+                  }
+                  icon = ImageView(this)
+                  root.addView(icon, LinearLayout.LayoutParams(dp(72), dp(72)))
+
+                  title = TextView(this).apply {
+                      textSize = 22f
+                      gravity = Gravity.CENTER
+                      setPadding(0, dp(16), 0, dp(4))
+                  }
+                  root.addView(title, matchWidth())
+
+                  val hint = TextView(this).apply {
+                      text = "Enter your PIN"
+                      gravity = Gravity.CENTER
+                  }
+                  root.addView(hint, matchWidth())
+
+                  dots = TextView(this).apply {
+                      textSize = 28f
+                      gravity = Gravity.CENTER
+                      letterSpacing = 0.4f
+                      setPadding(0, dp(24), 0, dp(8))
+                  }
+                  root.addView(dots, matchWidth())
+
+                  message = TextView(this).apply {
+                      gravity = Gravity.CENTER
+                      setTextColor(Color.rgb(229, 57, 53))
+                      minHeight = dp(24)
+                  }
+                  root.addView(message, matchWidth())
+
+                  val grid = GridLayout(this).apply { columnCount = 3 }
+                  val keys = listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "FP", "0", "DEL")
+                  for (key in keys) {
+                      val b = Button(this, null, android.R.attr.borderlessButtonStyle).apply {
+                          text = when (key) {
+                              "FP" -> "👆"
+                              "DEL" -> "⌫"
+                              else -> key
+                          }
+                          textSize = 26f
+                          setOnClickListener { press(key) }
+                      }
+                      if (key == "FP" && !biometricReady()) b.visibility = View.INVISIBLE
+                      val lp = GridLayout.LayoutParams().apply {
+                          width = dp(88)
+                          height = dp(72)
+                          setMargins(dp(6), dp(6), dp(6), dp(6))
+                      }
+                      grid.addView(b, lp)
+                  }
+                  val gridLp = LinearLayout.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT,
+                      ViewGroup.LayoutParams.WRAP_CONTENT
+                  ).apply { topMargin = dp(16) }
+                  root.addView(grid, gridLp)
+                  return root
+              }
+          }
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/java/com/myapps/applock/MainActivity.kt')"
+          cat > 'app/src/main/java/com/myapps/applock/MainActivity.kt' <<'EOF_APPLOCK'
+          package com.myapps.applock
+
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.drawable.ColorDrawable
+          import android.graphics.drawable.Drawable
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputFilter
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.BaseAdapter
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.FrameLayout
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AlertDialog
+          import androidx.appcompat.app.AppCompatActivity
+
+          /** Settings screen: set the PIN, turn protection on, and choose apps to lock. */
+          class MainActivity : AppCompatActivity() {
+
+              data class AppItem(val pkg: String, val label: String)
+
+              private lateinit var list: ListView
+              private lateinit var status: TextView
+              private lateinit var fpBox: CheckBox
+              private var apps: List<AppItem> = emptyList()
+              private val adapter = AppAdapter()
+              private var pinDialog: AlertDialog? = null
+              private var keepUnlocked = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  list = ListView(this)
+                  list.addHeaderView(buildHeader(), null, false)
+                  list.adapter = adapter
+                  list.setOnItemClickListener { parent, _, position, _ ->
+                      val item = parent.getItemAtPosition(position) as? AppItem ?: return@setOnItemClickListener
+                      val lockIt = item.pkg !in Prefs.lockedApps(this)
+                      Prefs.setLocked(this, item.pkg, lockIt)
+                      adapter.notifyDataSetChanged()
+                  }
+                  setContentView(list)
+                  loadApps()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  keepUnlocked = false
+                  // This screen is protected by the same PIN, so nobody else can change your settings.
+                  if (Prefs.hasPin(this) && packageName !in LockState.unlocked) {
+                      list.visibility = View.INVISIBLE
+                      startActivity(
+                          Intent(this, LockActivity::class.java).putExtra(LockActivity.EXTRA_PKG, packageName)
+                      )
+                      return
+                  }
+                  list.visibility = View.VISIBLE
+                  refresh()
+                  if (!Prefs.hasPin(this) && pinDialog?.isShowing != true) askNewPin()
+              }
+
+              override fun onStop() {
+                  super.onStop()
+                  if (!keepUnlocked && !isChangingConfigurations) LockState.unlocked.remove(packageName)
+              }
+
+              private fun refresh() {
+                  status.text = if (serviceEnabled()) {
+                      "✅ Protection is ON"
+                  } else {
+                      "⚠️ Protection is OFF. Tap the first button, open \"Installed apps\" (or \"Downloaded apps\"), choose App Lock and turn it on."
+                  }
+                  fpBox.isChecked = Prefs.useFingerprint(this)
+                  adapter.notifyDataSetChanged()
+              }
+
+              private fun serviceEnabled(): Boolean {
+                  val enabled = Settings.Secure.getString(
+                      contentResolver,
+                      Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                  ) ?: return false
+                  val cn = ComponentName(this, AppLockService::class.java)
+                  val names = listOf(cn.flattenToString(), cn.flattenToShortString())
+                  return enabled.split(':').any { entry -> names.any { it.equals(entry, ignoreCase = true) } }
+              }
+
+              private fun button(label: String, onClick: () -> Unit): Button =
+                  Button(this).apply {
+                      text = label
+                      isAllCaps = false
+                      setOnClickListener { onClick() }
+                  }
+
+              private fun buildHeader(): View {
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(16), dp(16), dp(8))
+                  }
+                  status = TextView(this).apply {
+                      textSize = 16f
+                      setPadding(0, 0, 0, dp(8))
+                  }
+                  box.addView(status)
+
+                  box.addView(button("1. Turn on protection (Accessibility)") {
+                      keepUnlocked = true
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  })
+                  box.addView(button("2. App info (restricted settings & battery)") {
+                      keepUnlocked = true
+                      startActivity(
+                          Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+                      )
+                  })
+
+                  fpBox = CheckBox(this).apply {
+                      text = "Unlock with fingerprint or face"
+                      setOnCheckedChangeListener { _, checked ->
+                          Prefs.setUseFingerprint(this@MainActivity, checked)
+                      }
+                  }
+                  box.addView(fpBox)
+
+                  box.addView(button("Change PIN") { askNewPin() })
+
+                  val pick = TextView(this).apply {
+                      text = "Tap the apps you want to lock:"
+                      textSize = 16f
+                      setPadding(0, dp(16), 0, 0)
+                  }
+                  box.addView(pick)
+                  return box
+              }
+
+              private fun askNewPin(first: String? = null) {
+                  val input = EditText(this).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+                      filters = arrayOf(InputFilter.LengthFilter(8))
+                      hint = "4 to 8 digits"
+                  }
+                  val wrap = FrameLayout(this).apply {
+                      setPadding(dp(24), dp(8), dp(24), 0)
+                      addView(input)
+                  }
+                  val canCancel = Prefs.hasPin(this)
+                  val builder = AlertDialog.Builder(this)
+                      .setTitle(if (first == null) "Create a PIN" else "Type the PIN again")
+                      .setView(wrap)
+                      .setCancelable(canCancel)
+                      .setPositiveButton("OK", null)
+                  if (canCancel) builder.setNegativeButton("Cancel", null)
+                  val dialog = builder.create()
+                  dialog.setOnShowListener {
+                      dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                          val pin = input.text.toString()
+                          when {
+                              pin.length < 4 -> input.error = "Use at least 4 digits"
+                              first == null -> {
+                                  dialog.dismiss()
+                                  askNewPin(pin)
+                              }
+                              pin != first -> {
+                                  dialog.dismiss()
+                                  toast("The PINs didn't match. Try again.")
+                                  askNewPin()
+                              }
+                              else -> {
+                                  Prefs.setPin(this, pin)
+                                  LockState.unlocked.add(packageName)
+                                  dialog.dismiss()
+                                  toast("PIN saved")
+                                  refresh()
+                              }
+                          }
+                      }
+                  }
+                  pinDialog = dialog
+                  dialog.show()
+              }
+
+              private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+              private fun loadApps() {
+                  Thread {
+                      val pm = packageManager
+                      val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                      val result = pm.queryIntentActivities(intent, 0)
+                          .map { AppItem(it.activityInfo.packageName, it.loadLabel(pm).toString()) }
+                          .filter { it.pkg != packageName }
+                          .distinctBy { it.pkg }
+                          .sortedBy { it.label.lowercase() }
+                      runOnUiThread {
+                          apps = result
+                          adapter.notifyDataSetChanged()
+                      }
+                  }.start()
+              }
+
+              inner class AppAdapter : BaseAdapter() {
+                  private val icons = HashMap<String, Drawable>()
+
+                  override fun getCount(): Int = apps.size
+                  override fun getItem(position: Int): Any = apps[position]
+                  override fun getItemId(position: Int): Long = position.toLong()
+
+                  override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+                      val row = convertView as? LinearLayout ?: makeRow()
+                      val item = apps[position]
+                      val iv = row.getChildAt(0) as ImageView
+                      val tv = row.getChildAt(1) as TextView
+                      val cb = row.getChildAt(2) as CheckBox
+                      iv.setImageDrawable(icons.getOrPut(item.pkg) {
+                          try {
+                              packageManager.getApplicationIcon(item.pkg)
+                          } catch (e: Exception) {
+                              ColorDrawable(Color.TRANSPARENT)
+                          }
+                      })
+                      tv.text = item.label
+                      cb.isChecked = item.pkg in Prefs.lockedApps(this@MainActivity)
+                      return row
+                  }
+
+                  private fun makeRow(): LinearLayout {
+                      val c = this@MainActivity
+                      val row = LinearLayout(c)
+                      row.orientation = LinearLayout.HORIZONTAL
+                      row.gravity = Gravity.CENTER_VERTICAL
+                      row.setPadding(c.dp(16), c.dp(8), c.dp(16), c.dp(8))
+                      row.addView(ImageView(c), LinearLayout.LayoutParams(c.dp(40), c.dp(40)))
+                      val tv = TextView(c)
+                      tv.textSize = 16f
+                      tv.setPadding(c.dp(16), 0, 0, 0)
+                      row.addView(tv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                      val cb = CheckBox(c)
+                      cb.isClickable = false
+                      cb.isFocusable = false
+                      row.addView(cb)
+                      return row
+                  }
+              }
+          }
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/java/com/myapps/applock/Prefs.kt')"
+          cat > 'app/src/main/java/com/myapps/applock/Prefs.kt' <<'EOF_APPLOCK'
+          package com.myapps.applock
+
+          import android.content.Context
+          import java.security.MessageDigest
+
+          /** Shared in-memory state (service and screens run in the same process). */
+          object LockState {
+              /** Apps unlocked since the user last went to the home screen or turned the screen off. */
+              val unlocked: MutableSet<String> = mutableSetOf()
+              var wrongTries = 0
+              var blockedUntil = 0L
+          }
+
+          fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+          /** Saved settings. The PIN is stored only as a hash, never as plain text. */
+          object Prefs {
+              private fun sp(c: Context) = c.getSharedPreferences("applock", Context.MODE_PRIVATE)
+
+              fun hasPin(c: Context): Boolean = sp(c).contains("pin_hash")
+
+              fun pinLength(c: Context): Int = sp(c).getInt("pin_len", 4)
+
+              fun setPin(c: Context, pin: String) {
+                  sp(c).edit().putString("pin_hash", hash(pin)).putInt("pin_len", pin.length).apply()
+              }
+
+              fun checkPin(c: Context, pin: String): Boolean = sp(c).getString("pin_hash", null) == hash(pin)
+
+              fun lockedApps(c: Context): Set<String> =
+                  sp(c).getStringSet("locked", null)?.toSet() ?: emptySet()
+
+              fun setLocked(c: Context, pkg: String, locked: Boolean) {
+                  val s = lockedApps(c).toMutableSet()
+                  if (locked) s.add(pkg) else s.remove(pkg)
+                  sp(c).edit().putStringSet("locked", s).apply()
+              }
+
+              fun useFingerprint(c: Context): Boolean = sp(c).getBoolean("fingerprint", true)
+
+              fun setUseFingerprint(c: Context, on: Boolean) {
+                  sp(c).edit().putBoolean("fingerprint", on).apply()
+              }
+
+              private fun hash(pin: String): String =
+                  MessageDigest.getInstance("SHA-256")
+                      .digest("applock-$pin".toByteArray())
+                      .joinToString("") { "%02x".format(it) }
+          }
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/res/drawable/ic_lock_fg.xml')"
+          cat > 'app/src/main/res/drawable/ic_lock_fg.xml' <<'EOF_APPLOCK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <group
+                  android:scaleX="2.5"
+                  android:scaleY="2.5"
+                  android:translateX="24"
+                  android:translateY="24">
+                  <path
+                      android:fillColor="#FFFFFF"
+                      android:pathData="M18,8h-1V6c0,-2.76 -2.24,-5 -5,-5S7,3.24 7,6v2H6c-1.1,0 -2,0.9 -2,2v10c0,1.1 0.9,2 2,2h12c1.1,0 2,-0.9 2,-2V10C20,8.9 19.1,8 18,8zM12,17c-1.1,0 -2,-0.9 -2,-2s0.9,-2 2,-2 2,0.9 2,2S13.1,17 12,17zM15.1,8H8.9V6c0,-1.71 1.39,-3.1 3.1,-3.1 1.71,0 3.1,1.39 3.1,3.1V8z" />
+              </group>
+          </vector>
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml')"
+          cat > 'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml' <<'EOF_APPLOCK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/icon_bg" />
+              <foreground android:drawable="@drawable/ic_lock_fg" />
+          </adaptive-icon>
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/res/values/colors.xml')"
+          cat > 'app/src/main/res/values/colors.xml' <<'EOF_APPLOCK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="icon_bg">#1E3A5F</color>
+          </resources>
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'EOF_APPLOCK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">App Lock</string>
+              <string name="accessibility_desc">Lets App Lock see which app you open, so it can ask for your PIN before showing locked apps. It does not read anything on your screen.</string>
+          </resources>
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'app/src/main/res/xml/accessibility_config.xml')"
+          cat > 'app/src/main/res/xml/accessibility_config.xml' <<'EOF_APPLOCK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="false"
+              android:description="@string/accessibility_desc"
+              android:notificationTimeout="50" />
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'EOF_APPLOCK'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'EOF_APPLOCK'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF_APPLOCK
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'EOF_APPLOCK'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AppLock"
+          include(":app")
+          EOF_APPLOCK
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build the APK
+        run: |
+          gradle assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk AppLock.apk
+
+      - name: Save APK (Actions tab)
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppLock-apk
+          path: AppLock.apk
+
+      - name: Publish APK (Releases page)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: App Lock build ${{ github.run_number }}
+          files: AppLock.apk
